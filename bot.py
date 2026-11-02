@@ -21,6 +21,8 @@ import sys
 from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -57,6 +59,9 @@ MAX_CHARGE = 50_000_000
 # CI mode (GitHub Actions): stay awake N seconds per run, then exit cleanly.
 # 0 = run forever (normal server deployment).
 AWAKE_SECONDS = int(os.getenv("AWAKE_SECONDS", "0") or "0")
+# CI chaining: at the end of each awake window, trigger the next run via the
+# GitHub API so the loop doesn't depend on cron choosing to show up.
+GITHUB_TRIGGER_NEXT = os.getenv("GITHUB_TRIGGER_NEXT", "1") == "1"
 
 EMOJI = {"pending": "⏳", "fired": "❓", "done": "✅", "skipped": "❌", "compensated": "🟩", "cancelled": "🗑"}
 
@@ -647,6 +652,32 @@ async def on_startup(app: Application) -> None:
     plan_daily_summary(app.job_queue)
 
 
+async def trigger_next_run() -> None:
+    """Chain the next wake-up immediately by asking GitHub to dispatch the workflow.
+
+    Runs only inside Actions (repo + token present). If this ever fails, the
+    cron schedule in bot.yml remains as the fallback.
+    """
+    repo = os.getenv("GITHUB_REPOSITORY", "")
+    token = os.getenv("GITHUB_TOKEN", "")
+    if not (GITHUB_TRIGGER_NEXT and AWAKE_SECONDS > 0 and repo and token):
+        return  # local run, or chaining disabled — nothing to do
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.github.com/repos/{repo}/actions/workflows/bot.yml/dispatches",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json={"ref": "main"},
+            )
+        log.info("Chained next run: HTTP %s", resp.status_code)
+    except Exception as exc:  # noqa: BLE001 - cron remains as safety net
+        log.warning("Chain trigger failed (cron still active as fallback): %s", exc)
+
+
 async def run_windowed(app: Application, seconds: int) -> None:
     """CI mode: live for a defined window, then exit cleanly.
 
@@ -660,6 +691,7 @@ async def run_windowed(app: Application, seconds: int) -> None:
     await app.start()
     log.info("Awake for %ss — processing updates…", seconds)
     await asyncio.sleep(seconds)
+    await trigger_next_run()
     log.info("Awake window over — shutting down cleanly.")
     await app.updater.stop()
     await app.stop()

@@ -13,6 +13,7 @@ concurrency:
 
 permissions:
   contents: write           # needed to commit the state database back to the repo
+  actions: write            # needed to self-trigger the next run (chaining)
 
 jobs:
   run:
@@ -25,6 +26,7 @@ jobs:
       OCR_LANG: eng
       AWAKE_SECONDS: "240"  # bot lives 4 min per run, then exits cleanly
       OCR_DEBUG: "1"        # temporary: dump raw OCR spans into the run log
+      GITHUB_TRIGGER_NEXT: "1"
       DB_PATH: work/bot.db
     steps:
       - uses: actions/checkout@v4
