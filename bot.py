@@ -21,7 +21,7 @@ import sys
 from datetime import datetime, timedelta, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -59,6 +59,37 @@ MAX_CHARGE = 50_000_000
 AWAKE_SECONDS = int(os.getenv("AWAKE_SECONDS", "0") or "0")
 
 EMOJI = {"pending": "⏳", "fired": "❓", "done": "✅", "skipped": "❌", "compensated": "🟩", "cancelled": "🗑"}
+
+# Permanent on-screen button keyboard (labels are intercepted in on_text)
+ANTICIPATING = [
+    "📸 Photo of schedule",
+    "⌨️ Type times",
+    "📋 Reminders",
+    "💳 Balance",
+    "💰 Charge",
+    "📊 Summary",
+    "📖 Help",
+]
+
+COMMANDS = [
+    ("start", "Account status / setup"),
+    ("help", "Full guide"),
+    ("list", "Upcoming reminders"),
+    ("cancel", "Cancel a reminder: /cancel 12"),
+    ("charge", "View or change your charge amount"),
+    ("balance", "Outstanding balance"),
+    ("summary", "Today's summary right now"),
+]
+
+
+def main_menu() -> ReplyKeyboardMarkup:
+    rows = [ANTICIPATING[0:2], ANTICIPATING[2:4], ANTICIPATING[4:6], ANTICIPATING[6:8]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+# Shortcut buttons (left to right) -> handler keys
+COMMAND_KEYS = ["photo", "times", "list", "balance", "charge", "summary", "help"]
+BUTTON_ACTIONS = dict(zip(ANTICIPATING, COMMAND_KEYS))
 
 
 # ------------------------------------------------------------------ helpers
@@ -156,13 +187,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/summary - today's summary right now\n"
         "/start - account status",
         parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(),
     )
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = storage.user_reminders(update.effective_user.id, ("pending", "fired"))
     if not rows:
-        await update.message.reply_text("You have no upcoming reminders. Send a photo or type some times!")
+        await update.message.reply_text(
+            "You have no upcoming reminders. Send a photo or type some times!",
+            reply_markup=main_menu(),
+        )
         return
     lines = ["<b>⏰ Upcoming reminders</b>", ""]
     for r in rows:
@@ -170,7 +205,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"{EMOJI[r['status']]} <code>#{r['id']}</code> {fmt_local(local_from_iso(r['fire_at']))} — {label}")
     lines.append("")
     lines.append("Cancel with /cancel &lt;id&gt;")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_menu())
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -61,9 +61,18 @@ jobs:
         env:
           DATA_KEY: ${{ secrets.DATA_KEY }}
         run: |
+          if [ -z "$DATA_KEY" ]; then
+            echo "::error::DATA_KEY secret is not set (or empty). Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [ ! -f work/bot.db ]; then
+            echo "::error::work/bot.db not found — the bot run did not leave a database behind."
+            exit 1
+          fi
           openssl enc -aes-256-cbc -pbkdf2 -in work/bot.db -out bot.db.enc -pass env:DATA_KEY
           git config user.name  "reminder-bot"
           git config user.email "bot@users.noreply.github.com"
           git add bot.db.enc
           git commit -m "chore: state update $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "No changes to commit."
+          git pull --rebase origin main || { echo "::error::git pull --rebase failed"; exit 1; }
           git push
