@@ -1,0 +1,8 @@
+services:
+  reminder-bot:
+    build: .
+    container_name: reminder-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data

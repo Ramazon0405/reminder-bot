@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]>=21.6,<23
+pytesseract>=0.3.13
+Pillow>=10.0
+tzdata
