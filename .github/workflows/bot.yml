@@ -24,6 +24,7 @@ jobs:
       SUMMARY_TIME: "23:00"
       OCR_LANG: eng
       AWAKE_SECONDS: "240"  # bot lives 4 min per run, then exits cleanly
+      OCR_DEBUG: "1"        # temporary: dump raw OCR spans into the run log
       DB_PATH: work/bot.db
     steps:
       - uses: actions/checkout@v4

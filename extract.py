@@ -33,6 +33,9 @@ _PRAYER_NAMES = ["Bomdod", "Quyosh", "Peshin", "Asr", "Shom", "Xufton"]
 _TIME_TOKEN = re.compile(r"^(\d{1,2})\s*[:.\-–—]\s*(\d{2})\s*[.,]?$")
 # Times anywhere inside typed text
 _TIME_IN_TEXT = re.compile(r"\b(\d{1,2})\s*[:.\-]\s*(\d{2})\b")
+# Digits glued right onto a label token, e.g. "Shom17:22" — no \b, letter-digit
+# transitions are not word boundaries
+_TIME_EMBEDDED = re.compile(r"(\d{1,2})\s*[:.\-–—]\s*(\d{2})")
 _AM_PM = re.compile(r"\b(a\.?m\.?|p\.?m\.?)\b", re.IGNORECASE)
 
 MAX_LABEL_LEN = 64
@@ -98,6 +101,12 @@ def _direct_time_spans(spans: list[dict]) -> list[tuple[str, dict]]:
             h, mi = int(m.group(1)), int(m.group(2))
             if _valid(h, mi):
                 out.append((_hhmm(h, mi), s))
+            continue
+        # time glued into the label token, e.g. "Shom17:22" or "Asr-15:36"
+        for mt in _TIME_EMBEDDED.finditer(s["text"]):
+            h, mi = int(mt.group(1)), int(mt.group(2))
+            if _valid(h, mi):
+                out.append((_hhmm(h, mi), s))
     return out
 
 
@@ -154,7 +163,8 @@ def _known_label(text: str) -> str | None:
     letters = letters.translate(_LOOKALIKE)
     for name in _PRAYER_NAMES:
         word = name.lower()
-        if _lev_within(letters[: len(word) + 2], word, 1 if len(word) <= 4 else 2):
+        # tolerate up to 2 misreads for the longer names, 1 for Asr
+        if _lev_within(letters[: len(word) + 2], word, 1 if len(word) <= 3 else 2):
             return name
     return None
 
@@ -198,9 +208,25 @@ def _shift_time(hhmm: str, minutes: int) -> str:
     return _hhmm(total // 60, total % 60)
 
 
+def _joined_pairs(spans: list[dict]) -> list[dict]:
+    """Offers synthetic spans joining consecutive same-row OCR tokens.
+
+    Catches labels OCR split apart ('Sh' + 'om' -> 'Shom') and label+time bumps.
+    Geometry-only concatenation — callers decide what a joined token means.
+    """
+    out = []
+    for a, b in zip(spans, spans[1:]):
+        same_row = abs(_yc(a) - _yc(b)) < max(a["h"], b["h"])
+        close = b["left"] <= (a["left"] + a["w"] + max(3, a["h"] * 0.6))
+        if same_row and close:
+            out.append({**a, "text": a["text"] + b["text"]})
+    return out
+
+
 def parse_prayer_schedule(spans: list[dict]) -> list[dict]:
-    label_spans = [(lbl, s) for s in spans if (lbl := _known_label(s["text"]))]
-    time_spans = _direct_time_spans(spans) + _pair_time_spans(spans)
+    candidates = spans + _joined_pairs(spans)
+    label_spans = [(lbl, s) for s in candidates if (lbl := _known_label(s["text"]))]
+    time_spans = _direct_time_spans(candidates) + _pair_time_spans(candidates)
     if not label_spans:
         return []
 
@@ -257,6 +283,7 @@ def parse_generic_schedule(spans: list[dict]) -> list[dict]:
 def parse_times_from_image(path: str) -> list[dict]:
     img = _prep_image(path)
     spans = _ocr_spans(img, "--psm 6")
+    _debug_spans(spans)
 
     items = parse_prayer_schedule(spans)      # fastest, format-aware path
     if items:
@@ -267,7 +294,22 @@ def parse_times_from_image(path: str) -> list[dict]:
 
     # retry: sparse layouts sometimes OCR better in psm 11
     spans = _ocr_spans(img, "--psm 11")
+    _debug_spans(spans)
     return parse_prayer_schedule(spans) or parse_generic_schedule(spans)
+
+
+def _debug_spans(spans: list[dict]) -> None:
+    """OCR_DEBUG=1 dumps raw OCR spans to stderr — for diagnosing runner OCR."""
+    if os.getenv("OCR_DEBUG") != "1":
+        return
+    import sys
+    print(f"[ocr-debug] {len(spans)} spans:", file=sys.stderr)
+    for s in spans:
+        print(
+            f"[ocr-debug] text={s['text']!r} x={s['left']} y={s['top']} "
+            f"w={s['w']} h={s['h']} line={s['line']}",
+            file=sys.stderr,
+        )
 
 
 # ------------------------------------------------------------ typed text
