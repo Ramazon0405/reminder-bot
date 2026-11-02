@@ -141,6 +141,10 @@ def ask_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+# Replies that always re-attach the button keyboard:
+# /start, charge saved, balance, summary, OCR hint, the "reading picture" note.
+
+
 # -------------------------------------------------------------- user flows
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -156,6 +160,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "to add reminders.\n"
             "Use /help to see all commands.",
             parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
         )
         return
 
@@ -248,13 +253,16 @@ async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = storage.get_user(update.effective_user.id)
     if user is None:
-        await update.message.reply_text("Press /start first to set up your account.")
+        await update.message.reply_text(
+            "Press /start first to set up your account.", reply_markup=main_menu()
+        )
         return
     await update.message.reply_text(
         f"💳 Your outstanding balance: <b>{money(user['balance'])}</b>\n\n"
         "❌ Skips add your charge amount.\n"
         "🟩 Compensation deducts half of it.",
         parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(),
     )
 
 
@@ -269,6 +277,7 @@ async def handle_times(update: Update, context: ContextTypes.DEFAULT_TYPE, items
             "• Send a clearer / brighter picture\n"
             "• Or just type them: <code>09:30 gym 14:00 lunch</code>",
             parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
         )
         return
 
@@ -304,7 +313,9 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     temp_path = None
     try:
-        await update.message.reply_text("👀 Reading the picture…")
+        await update.message.reply_text(
+            "👀 Reading the picture…", reply_markup=main_menu()
+        )
         photo = update.message.photo[-1]
         file = await photo.get_file()
         temp_path = f"ocr_{update.update_id}.jpg"
@@ -341,6 +352,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _save_charge(update, context, amount)
         return
 
+    # --- menu buttons tap -> dispatch to the matching handler
+    action = BUTTON_ACTIONS.get(text)
+    if action:
+        if action == "photo":
+            await update.message.reply_text(
+                "📸 Hit 📎 (attach) → Camera/Gallery and send the schedule picture — "
+                "I'll read the times right out of it.",
+                reply_markup=main_menu(),
+            )
+        elif action == "times":
+            await update.message.reply_text(
+                "⌨️ Send one or more times like:\n<code>09:30 gym</code>\n<code>14:00 client meeting</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu(),
+            )
+        elif action == "list":
+            await cmd_list(update, context)
+        elif action == "balance":
+            await cmd_balance(update, context)
+        elif action == "charge":
+            await cmd_charge(update, context)
+        elif action == "summary":
+            await cmd_summary(update, context)
+        elif action == "help":
+            await cmd_help(update, context)
+        return
+
     # --- normal text: treat as typed times
     if storage.get_user(update.effective_user.id) is None:
         ask_charge_amount(update, context)
@@ -359,6 +397,7 @@ async def _save_charge(update: Update, context: ContextTypes.DEFAULT_TYPE, amoun
         "📸 Now send a photo of today's schedule (or type times like <code>09:30 gym</code>) "
         "and I'll set the reminders.",
         parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(),
     )
 
 
@@ -613,7 +652,9 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     start_local = now_tz().replace(hour=0, minute=0, second=0, microsecond=0)
     events = storage.events_since(utc_iso(start_local))
     await update.message.reply_text(
-        _build_summary_text(users, events, start_local.date()), parse_mode=ParseMode.HTML
+        _build_summary_text(users, events, start_local.date()),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu(),
     )
 
 
@@ -650,6 +691,12 @@ async def on_startup(app: Application) -> None:
     log.info("Re-scheduled %d pending reminder(s)", len(storage.all_pending()))
 
     plan_daily_summary(app.job_queue)
+
+    try:
+        await app.bot.set_my_commands([BotCommand(cmd, desc) for cmd, desc in COMMANDS])
+        log.info("Telegram command menu registered (%d commands)", len(COMMANDS))
+    except Exception as exc:  # noqa: BLE001 - cosmetic feature, keep the bot alive
+        log.warning("Could not register command menu: %s", exc)
 
 
 async def trigger_next_run() -> None:
