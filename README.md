@@ -82,12 +82,21 @@ python bot.py
 | `SUMMARY_TIME` | `23:00` | daily summary send time |
 | `OCR_LANG` | `eng` | Tesseract languages, e.g. `eng+rus+uzb` (both packs are installed in the Docker image) |
 | `DB_PATH` | `data/bot.db` | SQLite location |
+| `SKIP_QUYOSH` | `1` | omit the Quyosh (sunrise) row from prayer-schedule screenshots |
+| `PRAYER_FIRE_OFFSET_MINUTES` | `30` | prayer-schedule reminders fire this many minutes *after* the prayer time |
 
 ## Notes
 
 - Each user sees and manages **their own** reminders and can only press buttons on their own reminders.
 - Anyone who `/start`s the bot can use it — per their choice this bot is open registration.
 - OCR works best on clear, well-lit, reasonably large text. Black-on-white prints/screenshots are ideal. If a label language isn't in the OCR pack, times still read fine (digits are language-independent); add packs with `apt install tesseract-ocr-<lang>` in the Dockerfile.
+
+**Prayer-schedule screenshots** are special-cased: the parser knows the row names
+(*Bomdod, Quyosh, Peshin, Asr, Shom, Xufton*), matches them fuzzily (so OCR misreads
+like `B0mdod` still match), attaches the nearest time on the row, skips **Quyosh**
+(sunrise — not an alarm), and schedules reminders `PRAYER_FIRE_OFFSET_MINUTES`
+(default **30**) minutes *after* each prayer time, with the label recording the
+original slot (e.g. `Bomdod (05:34)` → reminder at 06:04).
 
 ---
 

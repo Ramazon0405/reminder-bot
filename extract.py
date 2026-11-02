@@ -1,8 +1,14 @@
-"""Extract "HH:MM" times (with optional labels) from typed text or images.
+"""Extract "HH:MM" times (with labels) from typed text or images.
 
-Images are read with Tesseract OCR via pytesseract (must be installed on the
-host - see README / Dockerfile). Set OCR_LANG to change languages, e.g.
-"eng+rus+uzb".
+Two image modes:
+
+1. Prayer-schedule screenshots (Bomdod / Quyosh / Peshin / Asr / Shom / Xufton rows,
+   label left, time right — e.g. "Eslatish" screens). Rows are located by their
+   KNOWN labels, so OCR only has to read digits reliably.
+2. Any other schedule — generic scan for time-shaped text and nearest text on the
+   same line is used as the label.
+
+Requires the Tesseract binary (see README / Dockerfile). OCR_LANG selects OCR languages.
 """
 
 from __future__ import annotations
@@ -14,6 +20,14 @@ import pytesseract
 from PIL import Image
 
 OCR_LANG = os.getenv("OCR_LANG", "eng")
+
+# Quyosh is sunrise (not an alarm) inside prayer apps — excluded unless told otherwise
+SKIP_QUYOSH = os.getenv("SKIP_QUYOSH", "1") == "1"
+# Reminders fire this many minutes AFTER the prayer time shown on the screenshot
+PRAYER_FIRE_OFFSET_MINUTES = int(os.getenv("PRAYER_FIRE_OFFSET_MINUTES", "30"))
+
+# Known row labels of the prayer-schedule format (full-word fuzzy matching)
+_PRAYER_NAMES = ["Bomdod", "Quyosh", "Peshin", "Asr", "Shom", "Xufton"]
 
 # A time token inside OCR'd word text, e.g. "14:30" "9.05" "07-15" (punctuation tolerated)
 _TIME_TOKEN = re.compile(r"^(\d{1,2})\s*[:.\-–—]\s*(\d{2})\s*[.,]?$")
@@ -38,6 +52,226 @@ def _clean_label(words: list[str]) -> str:
     return label[:MAX_LABEL_LEN]
 
 
+# ------------------------------------------------------------------ OCR
+
+def _prep_image(path: str) -> Image.Image:
+    img = Image.open(path).convert("L")  # grayscale usually OCRs better
+    width, height = img.size
+    if width < 1200:  # upscale small screenshots for better OCR
+        scale = 2 if width < 800 else 1.5
+        img = img.resize((int(width * scale), int(height * scale)))
+    return img
+
+
+def _ocr_spans(img: Image.Image, tesseract_psm: str) -> list[dict]:
+    """Word-level OCR data as spans with positions."""
+    data = pytesseract.image_to_data(
+        img, lang=OCR_LANG, output_type=pytesseract.Output.DICT, config=tesseract_psm
+    )
+    spans: list[dict] = []
+    for i in range(len(data["text"])):
+        text = (data["text"][i] or "").replace("—", "-").replace("–", "-").strip()
+        if not text:
+            continue
+        spans.append(
+            {
+                "text": text,
+                "left": data["left"][i],
+                "top": data["top"][i],
+                "w": data["width"][i],
+                "h": data["height"][i],
+                "line": (data["block_num"][i], data["par_num"][i], data["line_num"][i]),
+            }
+        )
+    return spans
+
+
+def _yc(s: dict) -> float:
+    return s["top"] + s["h"] / 2
+
+
+def _direct_time_spans(spans: list[dict]) -> list[tuple[str, dict]]:
+    out = []
+    for s in spans:
+        m = _TIME_TOKEN.match(s["text"])
+        if m:
+            h, mi = int(m.group(1)), int(m.group(2))
+            if _valid(h, mi):
+                out.append((_hhmm(h, mi), s))
+    return out
+
+
+def _pair_time_spans(spans: list[dict]) -> list[tuple[str, dict]]:
+    """Catch times OCR split into two plain numbers ('05' + '34')."""
+    out = []
+    for a, b in zip(spans, spans[1:]):
+        ta, tb = a["text"], b["text"]
+        if not (ta.isdigit() and len(ta) == 2 and tb.isdigit() and len(tb) == 2):
+            continue
+        ha, mb = int(ta), int(tb)
+        same_row = abs(_yc(a) - _yc(b)) < max(a["h"], b["h"])
+        gap = b["left"] - (a["left"] + a["w"])
+        if _valid(ha, mb) and same_row and 0 < gap < 2.0 * a["w"]:
+            synth = dict(a)
+            synth["text"] = f"{ta}:{tb}"
+            out.append((_hhmm(ha, mb), synth))
+    return out
+
+
+# ------------------------------------------------- known prayer-row parser
+
+# Lookalike digits that OCR swaps into letters, e.g. "B0mdod" or "Sh0m"
+_LOOKALIKE = str.maketrans({
+    "0": "o", "1": "l", "2": "z", "3": "e", "4": "a",
+    "5": "s", "6": "b", "7": "t", "8": "b", "9": "g",
+})
+
+
+def _lev_within(a: str, b: str, limit: int) -> bool:
+    """Is the Levenshtein distance between a and b at most `limit`? (with early exit)"""
+    if abs(len(a) - len(b)) > limit:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > limit:
+            return False
+        prev = cur
+    return prev[-1] <= limit
+
+
+def _known_label(text: str) -> str | None:
+    """Match OCR'd row title to a known prayer name, tolerating misreads.
+
+    Word-based matching keeps greetings/titles ("Assalomu", "Eslatish") from
+    colliding with prayer names.
+    """
+    letters = "".join(ch for ch in text.lower() if ch.isalnum())
+    if len(letters) < 3:
+        return None
+    letters = letters.translate(_LOOKALIKE)
+    for name in _PRAYER_NAMES:
+        word = name.lower()
+        if _lev_within(letters[: len(word) + 2], word, 1 if len(word) <= 4 else 2):
+            return name
+    return None
+
+
+def _rows_from_labels_and_times(
+    label_spans: list[tuple[str, dict]], time_spans: list[tuple[str, dict]]
+) -> list[dict]:
+    """Nearest-vertical-centre assignment of each time to a known label."""
+    span_height = max((s["h"] for _, s in label_spans + time_spans), default=20)
+
+    candidates = []
+    for ti, (time_value, ts) in enumerate(time_spans):
+        for li, (label, ls) in enumerate(label_spans):
+            dist = abs(_yc(ts) - _yc(ls))
+            if dist <= 2.0 * span_height:
+                candidates.append((dist, li, ti))
+    candidates.sort()
+
+    used_labels: set[int] = set()
+    used_times: set[int] = set()
+    matches: list[tuple[str, str]] = []
+    for _, li, ti in candidates:
+        if li in used_labels or ti in used_times:
+            continue
+        used_labels.add(li)
+        used_times.add(ti)
+        matches.append((label_spans[li][0], time_spans[ti][0]))
+
+    if SKIP_QUYOSH:
+        matches = [(t, v) for t, v in matches if t != "Quyosh"]
+
+    items = [{"time": v, "label": t} for t, v in matches]
+    items.sort(key=lambda it: it["time"])
+    return items
+
+
+def _shift_time(hhmm: str, minutes: int) -> str:
+    """Shift HH:MM by a number of minutes (wraps past midnight)."""
+    h, m = (int(x) for x in hhmm.split(":"))
+    total = (h * 60 + m + minutes) % (24 * 60)
+    return _hhmm(total // 60, total % 60)
+
+
+def parse_prayer_schedule(spans: list[dict]) -> list[dict]:
+    label_spans = [(lbl, s) for s in spans if (lbl := _known_label(s["text"]))]
+    time_spans = _direct_time_spans(spans) + _pair_time_spans(spans)
+    if not label_spans:
+        return []
+
+    rows = _rows_from_labels_and_times(label_spans, time_spans)
+    offset = PRAYER_FIRE_OFFSET_MINUTES
+    if offset:
+        return [
+            {
+                "time": _shift_time(it["time"], offset),
+                "label": f"{it['label']} ({it['time']})",
+            }
+            for it in rows
+        ]
+    return rows
+
+
+
+# ------------------------------------------------------- generic fallback
+
+def parse_generic_schedule(spans: list[dict]) -> list[dict]:
+    """Scan for times; on each visual line, text right of the time (else left) is the label."""
+    lines: dict[tuple, list] = {}
+    for s in spans:
+        lines.setdefault(s["line"], []).append(s)
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    for key in sorted(lines):
+        words = sorted(lines[key], key=lambda s: s["left"])
+        joined = " ".join(s["text"] for s in words)
+        is_pm = bool(re.search(r"p\.?m\.?", joined, re.IGNORECASE))
+
+        for pos, (time_value, ts) in enumerate(_direct_time_spans(words) + _pair_time_spans(words)):
+            h, mi = (int(x) for x in time_value.split(":"))
+            if is_pm and h < 12:
+                h += 12
+                time_value = _hhmm(h, mi)
+            if time_value in seen:
+                continue
+            seen.add(time_value)
+            # find ts position inside words list
+            idx = words.index(ts) if ts in words else None
+            right = [s["text"] for s in words[idx + 1:]] if idx is not None else []
+            left = [s["text"] for s in words[:idx]] if idx is not None else []
+            label = _clean_label(right) or _clean_label(left)
+            items.append({"time": time_value, "label": label})
+
+    items.sort(key=lambda it: it["time"])
+    return items
+
+
+# ---------------------------------------------------------------- public
+
+def parse_times_from_image(path: str) -> list[dict]:
+    img = _prep_image(path)
+    spans = _ocr_spans(img, "--psm 6")
+
+    items = parse_prayer_schedule(spans)      # fastest, format-aware path
+    if items:
+        return items
+    items = parse_generic_schedule(spans)
+    if items:
+        return items
+
+    # retry: sparse layouts sometimes OCR better in psm 11
+    spans = _ocr_spans(img, "--psm 11")
+    return parse_prayer_schedule(spans) or parse_generic_schedule(spans)
+
+
+# ------------------------------------------------------------ typed text
+
 def parse_times_from_text(text: str) -> list[dict]:
     """Parse times from typed text, line by line.
 
@@ -52,8 +286,7 @@ def parse_times_from_text(text: str) -> list[dict]:
             h, minutes = int(m.group(1)), int(m.group(2))
             if not _valid(h, minutes):
                 continue
-            if _AM_PM.search(line[m.end(): m.end() + 5]) and re.search(r"pm", line[m.end(): m.end() + 5], re.I) \
-                    and h < 12:
+            if re.search(r"pm", line[m.end(): m.end() + 5], re.I) and h < 12:
                 h += 12
             key = _hhmm(h, minutes)
             if key in seen:
@@ -62,65 +295,4 @@ def parse_times_from_text(text: str) -> list[dict]:
             end = matches[idx + 1].start() if idx + 1 < len(matches) else len(line)
             label = _clean_label([line[m.end():end]])
             items.append({"time": key, "label": label})
-    return items
-
-
-def parse_times_from_image(path: str) -> list[dict]:
-    """OCR an image and return times with the nearest text on the same line as label."""
-    img = Image.open(path)
-    img = img.convert("L")  # grayscale usually OCRs better
-
-    # Upscale small images (phone screenshots) for better OCR accuracy
-    width, height = img.size
-    if width < 1200:
-        scale = 2 if width < 800 else 1.5
-        img = img.resize((int(width * scale), int(height * scale)))
-
-    data = pytesseract.image_to_data(
-        img,
-        lang=OCR_LANG,
-        output_type=pytesseract.Output.DICT,
-        config="--psm 6",
-    )
-
-    # Group OCR words into visual lines
-    lines: dict[tuple, list] = {}
-    count = len(data["text"])
-    for i in range(count):
-        word = (data["text"][i] or "").replace("—", "-").replace("–", "-").strip()
-        if not word:
-            continue
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        lines.setdefault(key, []).append((data["left"][i], word))
-
-    items: list[dict] = []
-    seen: set[str] = set()
-
-    for key in sorted(lines):
-        words = sorted(lines[key], key=lambda w: w[0])  # left to right
-        texts = [w for _, w in words]
-        is_pm = bool(re.search(r"p\.?m\.?", " ".join(texts), re.IGNORECASE))
-
-        for pos, (x, word) in enumerate(words):
-            m = _TIME_TOKEN.match(word)
-            if not m:
-                continue
-            h, minutes = int(m.group(1)), int(m.group(2))
-            if not _valid(h, minutes):
-                continue
-            if is_pm and h < 12:
-                h += 12
-            time_key = _hhmm(h, minutes)
-            if time_key in seen:
-                continue
-            seen.add(time_key)
-
-            # Label: other text on the same line, preferring words right of the time
-            right = [w for j, (x2, w) in enumerate(words) if j > pos and not _TIME_TOKEN.match(w)]
-            left = [w for j, (x2, w) in enumerate(words) if j < pos and not _TIME_TOKEN.match(w)]
-            label = _clean_label(right) or _clean_label(left)
-
-            items.append({"time": time_key, "label": label})
-
-    items.sort(key=lambda it: it["time"])
     return items
